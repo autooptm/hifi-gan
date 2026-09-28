@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
@@ -98,6 +100,9 @@ class Generator(torch.nn.Module):
         self.conv_post.apply(init_weights)
 
     def forward(self, x):
+        if _AO_FAST and _AO_GROUP and isinstance(self.resblocks[0], ResBlock1):
+            return _ao_generator_forward(self, x)
+
         x = self.conv_pre(x)
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, LRELU_SLOPE)
@@ -161,6 +166,67 @@ class DiscriminatorP(torch.nn.Module):
         return x, fmap
 
 
+_AO_FAST = os.environ.get("AO_HIFIGAN_FAST", "1") == "1"
+_AO_GROUP = os.environ.get("AO_HIFIGAN_OPT_2", "1") == "1"
+
+
+def _ao_pad_kernel(w, kmax):
+    k = w.shape[-1]
+    if k == kmax:
+        return w
+    left = (kmax - k) // 2
+    return F.pad(w, (left, kmax - k - left))
+
+
+def _ao_weight(conv):
+    for hook in conv._forward_pre_hooks.values():
+        hook(conv, None)
+    return conv.weight
+
+
+def _ao_generator_forward(g, x):
+    nk = g.num_kernels
+    kmax = max(b.convs1[0].kernel_size[0] for b in g.resblocks[:nk])
+    x = g.conv_pre(x)
+    for i in range(g.num_upsamples):
+        x = F.leaky_relu(x, LRELU_SLOPE)
+        x = g.ups[i](x)
+        blocks = [g.resblocks[i * nk + j] for j in range(nk)]
+        n, ch, length = x.shape
+        xg = x.repeat(1, nk, 1)
+        for it in range(len(blocks[0].convs1)):
+            d1 = blocks[0].convs1[it].dilation[0]
+            w1 = torch.cat([_ao_pad_kernel(_ao_weight(b.convs1[it]), kmax) for b in blocks], 0)
+            c1 = torch.cat([b.convs1[it].bias for b in blocks], 0)
+            w2 = torch.cat([_ao_pad_kernel(_ao_weight(b.convs2[it]), kmax) for b in blocks], 0)
+            c2 = torch.cat([b.convs2[it].bias for b in blocks], 0)
+            xt = F.leaky_relu(xg, LRELU_SLOPE)
+            xt = F.conv1d(xt, w1, c1, padding=(kmax * d1 - d1) // 2,
+                          dilation=d1, groups=nk)
+            xt = F.leaky_relu(xt, LRELU_SLOPE)
+            xt = F.conv1d(xt, w2, c2, padding=(kmax - 1) // 2, dilation=1, groups=nk)
+            xg = xt + xg
+        x = xg.view(n, nk, ch, length).sum(1) / nk
+    x = F.leaky_relu(x)
+    x = g.conv_post(x)
+    return torch.tanh(x)
+
+
+def _ao_paired_forward(discriminators, meanpools, y, y_hat):
+    y_d_rs, y_d_gs, fmap_rs, fmap_gs = [], [], [], []
+    cur = torch.cat([y, y_hat], dim=0)
+    for i, d in enumerate(discriminators):
+        if meanpools is not None and i != 0:
+            cur = meanpools[i - 1](cur)
+        out, fmap = d(cur)
+        half = out.shape[0] // 2
+        y_d_rs.append(out[:half])
+        y_d_gs.append(out[half:])
+        fmap_rs.append([f[:f.shape[0] // 2] for f in fmap])
+        fmap_gs.append([f[f.shape[0] // 2:] for f in fmap])
+    return y_d_rs, y_d_gs, fmap_rs, fmap_gs
+
+
 class MultiPeriodDiscriminator(torch.nn.Module):
     def __init__(self):
         super(MultiPeriodDiscriminator, self).__init__()
@@ -173,6 +239,9 @@ class MultiPeriodDiscriminator(torch.nn.Module):
         ])
 
     def forward(self, y, y_hat):
+        if _AO_FAST:
+            return _ao_paired_forward(self.discriminators, None, y, y_hat)
+
         y_d_rs = []
         y_d_gs = []
         fmap_rs = []
@@ -230,6 +299,9 @@ class MultiScaleDiscriminator(torch.nn.Module):
         ])
 
     def forward(self, y, y_hat):
+        if _AO_FAST:
+            return _ao_paired_forward(self.discriminators, self.meanpools, y, y_hat)
+
         y_d_rs = []
         y_d_gs = []
         fmap_rs = []
@@ -265,8 +337,8 @@ def discriminator_loss(disc_real_outputs, disc_generated_outputs):
         r_loss = torch.mean((1-dr)**2)
         g_loss = torch.mean(dg**2)
         loss += (r_loss + g_loss)
-        r_losses.append(r_loss.item())
-        g_losses.append(g_loss.item())
+        r_losses.append(r_loss.detach())
+        g_losses.append(g_loss.detach())
 
     return loss, r_losses, g_losses
 

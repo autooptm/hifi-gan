@@ -1,3 +1,64 @@
+<div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>hifi-gan · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>1.47x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-1.47x-2ea44f"></a>
+    <a href="https://github.com/jik876/hifi-gan/commit/4769534d45265d52a904b850da5a622601885777"><img alt="base" src="https://img.shields.io/badge/upstream-4769534d4526-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-RTX%204090-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [jik876/hifi-gan](https://github.com/jik876/hifi-gan) at commit
+> [`4769534d4526`](https://github.com/jik876/hifi-gan/commit/4769534d45265d52a904b850da5a622601885777) with the AutoOptm patch applied on top.
+> The optimisation was found, measured and verified automatically by [AutoOptm](https://autooptm.com);
+> the patch is also kept verbatim at [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+Every change is on by default and is behind a switch; see [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch). `meldataset.py` also carries the two call-site fixes that current librosa (>= 0.10) and PyTorch (>= 2.0) require; the arithmetic there is unchanged.
+
+## The result
+
+| | |
+|---|---|
+| **Command** | `python train.py --config config_v1.json` |
+| **Entry point** | `train.py` |
+| **Unit measured** | one training step on LJSpeech (generator forward → MPD + MSD discriminator update → generator update), batch 16 × 8192 samples |
+| **Before (stock)** | 189.7 ms per unit |
+| **After (this tree, all switches at their defaults)** | 129.0 ms per unit |
+| **Speedup** | **1.47x** end to end on RTX 4090, wall clock over two full epochs (1,615 steps, data loading included), run-to-run spread 0.23% |
+| **Output** | per-step loss curve interleaves the stock curve (mean gap 0.66% of the loss); mel-spectrogram L1 after two epochs 0.544 / 0.539 against stock's 0.545 / 0.544 |
+
+### What changed
+
+| File | Where | Gain (alone) |
+|---|---|---|
+| `train.py` | train() | 1.106x |
+| `models.py` | MultiPeriodDiscriminator.forward / MultiScaleDiscriminator.forward | 1.084x |
+| `models.py` | Generator.forward | 1.061x |
+| `models.py` | discriminator_loss() | 1.0x |
+| `meldataset.py` | mel_spectrogram() | 1.0x, needed on current librosa / PyTorch |
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/hifi-gan-ao.git
+cd hifi-gan-ao
+# set up exactly as upstream documents (LJSpeech wavs in LJSpeech-1.1/wavs), then:
+python train.py --config config_v1.json
+```
+
+The diff against upstream is one commit: `git log -1 -p` shows it, and
+`git diff 4769534d4526` is the same patch as `.autooptm/autooptm.patch`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
 # HiFi-GAN: Generative Adversarial Networks for Efficient and High Fidelity Speech Synthesis
 
 ### Jungil Kong, Jaehyeon Kim, Jaekyoung Bae

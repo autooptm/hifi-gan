@@ -1,5 +1,6 @@
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
+import contextlib
 import itertools
 import os
 import time
@@ -19,6 +20,23 @@ from models import Generator, MultiPeriodDiscriminator, MultiScaleDiscriminator,
 from utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint
 
 torch.backends.cudnn.benchmark = True
+
+_AO_OPT_1 = os.environ.get("AO_HIFIGAN_OPT_1", "1") == "1"
+
+
+def _ao_ctx():
+    if _AO_OPT_1 and torch.cuda.is_available():
+        return torch.autocast("cuda", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
+
+
+_AO_LOADER = os.environ.get("AO_HIFIGAN_OPT_3", "0") == "1"
+
+
+def _ao_loader_kwargs(h):
+    if _AO_LOADER and h.num_workers > 0:
+        return dict(prefetch_factor=6, persistent_workers=True)
+    return {}
 
 
 def train(rank, a, h):
@@ -84,7 +102,8 @@ def train(rank, a, h):
                               sampler=train_sampler,
                               batch_size=h.batch_size,
                               pin_memory=True,
-                              drop_last=True)
+                              drop_last=True,
+                              **_ao_loader_kwargs(h))
 
     if rank == 0:
         validset = MelDataset(validation_filelist, h.segment_size, h.n_fft, h.num_mels,
@@ -119,41 +138,42 @@ def train(rank, a, h):
             y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
             y = y.unsqueeze(1)
 
-            y_g_hat = generator(x)
-            y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size,
-                                          h.fmin, h.fmax_for_loss)
+            with _ao_ctx():
+                y_g_hat = generator(x)
+                y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1).float(), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size,
+                                              h.fmin, h.fmax_for_loss)
 
-            optim_d.zero_grad()
+                optim_d.zero_grad()
 
-            # MPD
-            y_df_hat_r, y_df_hat_g, _, _ = mpd(y, y_g_hat.detach())
-            loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(y_df_hat_r, y_df_hat_g)
+                # MPD
+                y_df_hat_r, y_df_hat_g, _, _ = mpd(y, y_g_hat.detach())
+                loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(y_df_hat_r, y_df_hat_g)
 
-            # MSD
-            y_ds_hat_r, y_ds_hat_g, _, _ = msd(y, y_g_hat.detach())
-            loss_disc_s, losses_disc_s_r, losses_disc_s_g = discriminator_loss(y_ds_hat_r, y_ds_hat_g)
+                # MSD
+                y_ds_hat_r, y_ds_hat_g, _, _ = msd(y, y_g_hat.detach())
+                loss_disc_s, losses_disc_s_r, losses_disc_s_g = discriminator_loss(y_ds_hat_r, y_ds_hat_g)
 
-            loss_disc_all = loss_disc_s + loss_disc_f
+                loss_disc_all = loss_disc_s + loss_disc_f
 
-            loss_disc_all.backward()
-            optim_d.step()
+                loss_disc_all.float().backward()
+                optim_d.step()
 
-            # Generator
-            optim_g.zero_grad()
+                # Generator
+                optim_g.zero_grad()
 
-            # L1 Mel-Spectrogram Loss
-            loss_mel = F.l1_loss(y_mel, y_g_hat_mel) * 45
+                # L1 Mel-Spectrogram Loss
+                loss_mel = F.l1_loss(y_mel, y_g_hat_mel) * 45
 
-            y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = mpd(y, y_g_hat)
-            y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = msd(y, y_g_hat)
-            loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
-            loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
-            loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
-            loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
-            loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel
+                y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = mpd(y, y_g_hat)
+                y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = msd(y, y_g_hat)
+                loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
+                loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
+                loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
+                loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
+                loss_gen_all = (loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel).float()
 
-            loss_gen_all.backward()
-            optim_g.step()
+                loss_gen_all.backward()
+                optim_g.step()
 
             if rank == 0:
                 # STDOUT logging
